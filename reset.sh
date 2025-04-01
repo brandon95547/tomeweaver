@@ -12,8 +12,4 @@ rm -f *.db
 echo "🗑️ Deleting audit_log.txt..."
 rm -f audit_log.txt
 
-# Empty the structured_output.md file
-echo "📄 Clearing contents of structured_output.md..."
-: > structured_output.md
-
 echo "✅ Reset complete."
