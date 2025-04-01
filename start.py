@@ -93,23 +93,25 @@ def load_faiss_index() -> faiss.IndexFlatIP:
 faiss_index = load_faiss_index()
 
 # Load text file
-input_file = Path("pizza.txt")
+input_file = Path("tmp/pizza.txt")
 with input_file.open("r", encoding="utf-8") as f:
     full_text = f.read()
 
-def split_text_into_chunks(text: str, max_chars: int = 5000) -> List[str]:
+def split_text_into_chunks(text: str, max_chars: int = 8000) -> List[str]:
     chunks = []
     while len(text) > max_chars:
-        split_at = text.rfind("\n", 0, max_chars)
+        split_at = text.rfind('.', 0, max_chars)
+        if split_at == -1:
+            split_at = text.rfind('\n', 0, max_chars)
         if split_at == -1:
             split_at = max_chars
-        chunks.append(text[:split_at].strip())
-        text = text[split_at:].strip()
+        chunks.append(text[:split_at + 1].strip())
+        text = text[split_at + 1:].strip()
     if text:
         chunks.append(text)
     return chunks
 
-chunks = split_text_into_chunks(full_text, max_chars=5000)
+chunks = split_text_into_chunks(full_text)
 print(f"Split into {len(chunks)} chunks.")
 
 # Load TOC and normalize headings
@@ -124,12 +126,19 @@ toc_heading_set = set(line.lstrip("#").strip() for line in toc_headings_list)
 prompt_template = (
     "You are a professional book editor working with the following existing Table of Contents:\n"
     + "\n".join(toc_headings_list) +
-    "\nYour task is to read the provided raw text and do the following:\n"
-    "1. Choose the most relevant heading or subheading from the Table of Contents.\n"
-    "2. Place that heading at the top of your response.\n"
-    "3. Organize the chunk’s content underneath using logical structure (PART > Chapter > Subsection > Bullet points).\n"
-    "4. Do not create new top-level sections ever.\n"
-    "5. Keep formatting markdown-compliant.\n\n"
+    "\n\nYour task is to read the provided raw text and do the following:\n"
+    "1. Identify ALL headings and subheadings from the Table of Contents that are relevant to this chunk.\n"
+    "2. For each relevant heading, organize the chunk’s content underneath it using logical structure (PART > Chapter > Subsection > Bullet points).\n"
+    "3. Repeat this for each matching heading, if applicable.\n"
+    "4. Do NOT invent new top-level sections or change the original ToC.\n"
+    "5. Use markdown formatting consistently.\n\n"
+    "Output format:\n"
+    "# Matching TOC Heading A\n"
+    "## Organized Content\n"
+    "(structured info here...)\n\n"
+    "# Matching TOC Heading B\n"
+    "## Organized Content\n"
+    "(more structured info...)\n\n"
     "Text: {chunk}"
 )
 
