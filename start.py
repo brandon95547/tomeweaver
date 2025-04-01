@@ -4,6 +4,7 @@ import requests
 import hashlib
 import sqlite3
 import numpy as np
+import time
 from pathlib import Path
 from typing import List
 from dotenv import load_dotenv
@@ -50,15 +51,26 @@ def serialize_vector(vec: List[float]) -> bytes:
 def deserialize_vector(blob: bytes) -> np.ndarray:
     return np.frombuffer(blob, dtype=np.float32)
 
-def get_embedding(text: str) -> List[float]:
-    response = requests.post(HF_EMBEDDING_API, headers=HEADERS, json={"inputs": text})
-    data = response.json()
-    if isinstance(data, list) and isinstance(data[0], list):
-        return data[0]
-    elif isinstance(data, list):
-        return data
-    else:
-        raise ValueError("Invalid embedding format")
+def get_embedding(text: str, retries: int = 3, delay: int = 5) -> List[float]:
+    for attempt in range(retries):
+        try:
+            response = requests.post(HF_EMBEDDING_API, headers=HEADERS, json={"inputs": text}, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+
+            if isinstance(data, list) and isinstance(data[0], list):
+                return data[0]
+            elif isinstance(data, list):
+                return data
+            else:
+                raise ValueError("Invalid embedding format")
+        except Exception as e:
+            print(f"[HuggingFace Error] Attempt {attempt + 1} of {retries}: {e}")
+            if attempt < retries - 1:
+                time.sleep(delay)
+            else:
+                print("\u274c Skipping chunk due to repeated Hugging Face errors.")
+                return None
 
 def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
     dot = np.dot(vec1, vec2)
@@ -69,12 +81,10 @@ def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
 # Load existing embeddings into FAISS
 def load_faiss_index() -> faiss.IndexFlatIP:
     index = faiss.IndexFlatIP(DIMENSIONS)
-    ids = []
     vectors = []
-    cursor.execute("SELECT id, embedding FROM embeddings")
-    for row_id, blob in cursor.fetchall():
+    cursor.execute("SELECT embedding FROM embeddings")
+    for (blob,) in cursor.fetchall():
         vec = deserialize_vector(blob)
-        ids.append(row_id)
         vectors.append(vec)
     if vectors:
         index.add(np.array(vectors, dtype=np.float32))
@@ -83,7 +93,7 @@ def load_faiss_index() -> faiss.IndexFlatIP:
 faiss_index = load_faiss_index()
 
 # Load text file
-input_file = Path("tmp/pizza.txt")
+input_file = Path("pizza.txt")
 with input_file.open("r", encoding="utf-8") as f:
     full_text = f.read()
 
@@ -117,7 +127,7 @@ prompt_template = (
     "\nYour task is to read the provided raw text and do the following:\n"
     "1. Choose the most relevant heading or subheading from the Table of Contents.\n"
     "2. Place that heading at the top of your response.\n"
-    "3. Organize the chunk’s content underneath and expand as much as possible using logical structure (PART > Chapter > Subsection > Bullet points).\n"
+    "3. Organize the chunk’s content underneath using logical structure (PART > Chapter > Subsection > Bullet points).\n"
     "4. Do not create new top-level sections ever.\n"
     "5. Keep formatting markdown-compliant.\n\n"
     "Text: {chunk}"
@@ -134,14 +144,17 @@ for i, chunk in enumerate(chunks):
         print("-> Skipping chunk (already in DB)")
         continue
 
-    chunk_emb = np.array(get_embedding(chunk), dtype=np.float32).reshape(1, -1)
+    embedding_vector = get_embedding(chunk)
+    if embedding_vector is None:
+        continue  # skip this chunk if embedding failed
+
+    chunk_emb = np.array(embedding_vector, dtype=np.float32).reshape(1, -1)
     if faiss_index.ntotal > 0:
         scores, _ = faiss_index.search(chunk_emb, k=1)
         if scores[0][0] > SIMILARITY_THRESHOLD:
             print("-> Skipping chunk (FAISS match found)")
             continue
 
-    # Prepare AI prompt
     prompt = prompt_template.format(chunk=chunk)
     response = deepseek_client.chat.completions.create(
         model="deepseek-chat",
@@ -155,7 +168,6 @@ for i, chunk in enumerate(chunks):
     organized_output = response.choices[0].message.content
     organized_sections.append(organized_output)
 
-    # Save to DB + FAISS
     cursor.execute("INSERT INTO embeddings (id, chunk, embedding) VALUES (?, ?, ?)", (
         chunk_hash,
         chunk,
@@ -192,8 +204,7 @@ for section in organized_sections:
     except StopIteration:
         print(f"Warning: Heading '{heading_line}' not found in toc/full.md. Skipping.")
 
-# Save updated Markdown
 with full_md_path.open("w", encoding="utf-8") as f:
     f.writelines(full_md_lines)
 
-print("✅ Updated toc/full.md and embeddings database.")
+print("\u2705 Updated toc/full.md and embeddings database.")

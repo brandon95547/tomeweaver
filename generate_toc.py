@@ -1,5 +1,3 @@
-# DeepSeek TOC Extractor with Final Grouping Pass (Writes Individual Files)
-
 import os
 import openai
 import json
@@ -8,6 +6,7 @@ from pathlib import Path
 from typing import List, Set
 from dotenv import load_dotenv
 import re
+import time
 
 # Load environment variables from .env
 load_dotenv()
@@ -21,7 +20,7 @@ HF_EMBEDDING_API = "https://api-inference.huggingface.co/pipeline/feature-extrac
 HF_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
 HEADERS = {"Authorization": f"Bearer {HF_API_KEY}"}
 
-input_file = Path("pizza.txt")
+input_file = Path("tmp/pizza.txt")
 with input_file.open("r", encoding="utf-8") as f:
     full_text = f.read()
 
@@ -45,15 +44,26 @@ print(f"Split into {len(chunks)} chunks.")
 SIMILARITY_THRESHOLD = 0.90
 seen_embeddings = []
 
-def get_embedding(text: str) -> List[float]:
-    response = requests.post(HF_EMBEDDING_API, headers=HEADERS, json={"inputs": text})
-    data = response.json()
-    if isinstance(data, list) and isinstance(data[0], list):
-        return data[0]
-    elif isinstance(data, list):
-        return data
-    else:
-        raise ValueError("Invalid embedding format returned from Hugging Face API")
+def get_embedding(text: str, retries: int = 3, delay: int = 5) -> List[float]:
+    for attempt in range(retries):
+        try:
+            response = requests.post(HF_EMBEDDING_API, headers=HEADERS, json={"inputs": text}, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+
+            if isinstance(data, list) and isinstance(data[0], list):
+                return data[0]
+            elif isinstance(data, list):
+                return data
+            else:
+                raise ValueError("Invalid embedding format returned from Hugging Face API")
+        except Exception as e:
+            print(f"[HuggingFace Error] Attempt {attempt + 1} of {retries}: {e}")
+            if attempt < retries - 1:
+                time.sleep(delay)
+            else:
+                print("\u274c Skipping embedding due to repeated Hugging Face errors.")
+                return None
 
 def cosine_similarity(vec1, vec2):
     dot = sum(a * b for a, b in zip(vec1, vec2))
@@ -94,8 +104,12 @@ for i, chunk in enumerate(chunks):
             continue
 
         embedding = get_embedding(stripped)
+        if embedding is None:
+            continue
+
         if any(cosine_similarity(embedding, seen) > SIMILARITY_THRESHOLD for seen in seen_embeddings):
             continue
+
         if stripped not in heading_texts:
             heading_texts.add(stripped)
             seen_embeddings.append(embedding)
