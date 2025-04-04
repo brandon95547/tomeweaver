@@ -24,7 +24,7 @@ input_file = Path("tmp/pizza.txt")
 with input_file.open("r", encoding="utf-8") as f:
     full_text = f.read()
 
-def split_text_into_chunks(text: str, max_chars: int = 8000) -> List[str]:
+def split_text_into_chunks(text: str, max_chars: int = 10000) -> List[str]:
     chunks = []
     while len(text) > max_chars:
         split_at = text.rfind('.', 0, max_chars)
@@ -120,6 +120,7 @@ final_prompt = (
     "Organize the following list of headings into a complete and coherent Table of Contents for a structured investigation.\n"
     "Group similar topics under appropriate Parts, with a clear hierarchy using only '#', '##', and '###'.\n"
     "Do not change the wording of the headings.\n"
+    "Make sure each heading is unique and there are no duplicates, creating a precise, non-redundant outline."
     "Preserve the order as much as possible, but feel free to group logically.\n"
     "Here are the extracted headings:\n\n"
     f"{chr(10).join(toc_sections)}"

@@ -1,3 +1,4 @@
+# Import standard and third-party libraries
 import os
 import json
 import requests
@@ -10,27 +11,29 @@ from typing import List
 from dotenv import load_dotenv
 import openai
 import faiss
+import re
 
-# Load .env
+# Load environment variables from a .env file
 load_dotenv()
 
-# OpenAI DeepSeek
+# Initialize DeepSeek client with API key and custom base URL
 deepseek_client = openai.OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com"
 )
 
-# Hugging Face Embedding API
+# Hugging Face API endpoint and authentication
 HF_EMBEDDING_API = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
 HF_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
 HEADERS = {"Authorization": f"Bearer {HF_API_KEY}"}
 
-# SQLite + FAISS setup
+# SQLite database and FAISS index setup
 DB_PATH = "embeddings.db"
 INDEX_PATH = "faiss.index"
-DIMENSIONS = 384  # MiniLM-L6-v2 returns 384-dim vectors
+DIMENSIONS = 384
 SIMILARITY_THRESHOLD = 0.90
 
+# Set up SQLite DB and create table for storing chunk embeddings
 conn = sqlite3.connect(DB_PATH)
 cursor = conn.cursor()
 cursor.execute("""
@@ -42,22 +45,25 @@ CREATE TABLE IF NOT EXISTS embeddings (
 """)
 conn.commit()
 
+# Utility: Hash a text string (for deduplication)
 def hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
+# Utility: Serialize a list of floats into bytes (for SQLite storage)
 def serialize_vector(vec: List[float]) -> bytes:
     return np.array(vec, dtype=np.float32).tobytes()
 
+# Utility: Deserialize bytes back into a NumPy array
 def deserialize_vector(blob: bytes) -> np.ndarray:
     return np.frombuffer(blob, dtype=np.float32)
 
+# Get sentence embedding using Hugging Face API with retries
 def get_embedding(text: str, retries: int = 3, delay: int = 5) -> List[float]:
     for attempt in range(retries):
         try:
             response = requests.post(HF_EMBEDDING_API, headers=HEADERS, json={"inputs": text}, timeout=30)
             response.raise_for_status()
             data = response.json()
-
             if isinstance(data, list) and isinstance(data[0], list):
                 return data[0]
             elif isinstance(data, list):
@@ -69,16 +75,10 @@ def get_embedding(text: str, retries: int = 3, delay: int = 5) -> List[float]:
             if attempt < retries - 1:
                 time.sleep(delay)
             else:
-                print("\u274c Skipping chunk due to repeated Hugging Face errors.")
+                print("\u274c Skipping due to repeated Hugging Face errors.")
                 return None
 
-def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
-    dot = np.dot(vec1, vec2)
-    norm1 = np.linalg.norm(vec1)
-    norm2 = np.linalg.norm(vec2)
-    return float(dot / (norm1 * norm2))
-
-# Load existing embeddings into FAISS
+# Load all stored embeddings from SQLite into FAISS index for similarity search
 def load_faiss_index() -> faiss.IndexFlatIP:
     index = faiss.IndexFlatIP(DIMENSIONS)
     vectors = []
@@ -92,12 +92,13 @@ def load_faiss_index() -> faiss.IndexFlatIP:
 
 faiss_index = load_faiss_index()
 
-# Load text file
+# Load input text to be organized
 input_file = Path("tmp/pizza.txt")
 with input_file.open("r", encoding="utf-8") as f:
     full_text = f.read()
 
-def split_text_into_chunks(text: str, max_chars: int = 8000) -> List[str]:
+# Split large input text into smaller chunks
+def split_text_into_chunks(text: str, max_chars: int = 10000) -> List[str]:
     chunks = []
     while len(text) > max_chars:
         split_at = text.rfind('.', 0, max_chars)
@@ -114,15 +115,15 @@ def split_text_into_chunks(text: str, max_chars: int = 8000) -> List[str]:
 chunks = split_text_into_chunks(full_text)
 print(f"Split into {len(chunks)} chunks.")
 
-# Load TOC and normalize headings
+# Load Table of Contents
 full_md_path = Path("toc/full.md")
 with full_md_path.open("r", encoding="utf-8") as f:
     full_md_lines = f.readlines()
 
+# Extract headings
 toc_headings_list = [line.strip() for line in full_md_lines if line.strip().startswith("#")]
 toc_heading_set = set(line.lstrip("#").strip() for line in toc_headings_list)
 
-# Prompt template
 prompt_template = (
     "You are a professional book editor working with the following existing Table of Contents:\n"
     + "\n".join(toc_headings_list) +
@@ -134,10 +135,8 @@ prompt_template = (
     "5. Use markdown formatting consistently.\n\n"
     "Output format:\n"
     "# Matching TOC Heading A\n"
-    "## Organized Content\n"
     "(structured info here...)\n\n"
     "# Matching TOC Heading B\n"
-    "## Organized Content\n"
     "(more structured info...)\n\n"
     "Text: {chunk}"
 )
@@ -146,23 +145,6 @@ organized_sections = []
 
 for i, chunk in enumerate(chunks):
     print(f"Processing chunk {i+1}/{len(chunks)}...")
-
-    chunk_hash = hash_text(chunk)
-    cursor.execute("SELECT 1 FROM embeddings WHERE id = ?", (chunk_hash,))
-    if cursor.fetchone():
-        print("-> Skipping chunk (already in DB)")
-        continue
-
-    embedding_vector = get_embedding(chunk)
-    if embedding_vector is None:
-        continue  # skip this chunk if embedding failed
-
-    chunk_emb = np.array(embedding_vector, dtype=np.float32).reshape(1, -1)
-    if faiss_index.ntotal > 0:
-        scores, _ = faiss_index.search(chunk_emb, k=1)
-        if scores[0][0] > SIMILARITY_THRESHOLD:
-            print("-> Skipping chunk (FAISS match found)")
-            continue
 
     prompt = prompt_template.format(chunk=chunk)
     response = deepseek_client.chat.completions.create(
@@ -177,41 +159,66 @@ for i, chunk in enumerate(chunks):
     organized_output = response.choices[0].message.content
     organized_sections.append(organized_output)
 
-    cursor.execute("INSERT INTO embeddings (id, chunk, embedding) VALUES (?, ?, ?)", (
-        chunk_hash,
-        chunk,
-        serialize_vector(chunk_emb.flatten())
-    ))
-    conn.commit()
-    faiss_index.add(chunk_emb)
+# Insert all structured sections
+heading_pattern = re.compile(r"^(#+)\s+(.*)")
 
-# Insert organized output into full.md
 for section in organized_sections:
     lines = section.strip().splitlines()
-    if not lines:
-        continue
-    heading_line = lines[0].strip()
-    content_lines = lines[1:]
-    normalized_heading = heading_line.lstrip("#").strip()
+    i = 0
+    while i < len(lines):
+        match = heading_pattern.match(lines[i])
+        if match:
+            heading_level, heading_text = match.groups()
+            normalized_heading = heading_text.strip()
+            content_lines = []
 
-    if normalized_heading not in toc_heading_set:
-        print(f"Warning: Heading '{heading_line}' not found in toc/full.md. Skipping.")
-        continue
+            i += 1
+            while i < len(lines) and not heading_pattern.match(lines[i]):
+                content_lines.append(lines[i])
+                i += 1
 
-    try:
-        insert_index = next(
-            i for i, line in enumerate(full_md_lines)
-            if line.lstrip("#").strip() == normalized_heading
-        )
-        insert_index += 1
-        while insert_index < len(full_md_lines) and not (
-            full_md_lines[insert_index].strip().startswith("#")
-            or full_md_lines[insert_index].strip() == ""
-        ):
-            insert_index += 1
-        full_md_lines.insert(insert_index, "\n" + "\n".join(content_lines) + "\n")
-    except StopIteration:
-        print(f"Warning: Heading '{heading_line}' not found in toc/full.md. Skipping.")
+            if normalized_heading not in toc_heading_set:
+                print(f"Warning: Heading '{normalized_heading}' not found in toc/full.md. Skipping.")
+                continue
+
+            new_block = "\n" + "\n".join(content_lines).strip() + "\n"
+            print(f"new_block -- {new_block}")
+
+            # Similarity check using new_block
+            new_block_embedding = get_embedding(new_block)
+            if new_block_embedding is None:
+                print("-> Skipping new_block due to embedding error.")
+                continue
+
+            new_block_emb = np.array(new_block_embedding, dtype=np.float32).reshape(1, -1)
+
+            if faiss_index.ntotal > 0:
+                scores, _ = faiss_index.search(new_block_emb, k=1)
+                if scores[0][0] > SIMILARITY_THRESHOLD:
+                    print(f"-> Skipping new_block under '{normalized_heading}' (FAISS duplicate)")
+                    continue
+
+            # Insert block and update FAISS + DB
+            try:
+                heading_index = next(
+                    idx for idx, line in enumerate(full_md_lines)
+                    if line.lstrip("#").strip() == normalized_heading
+                )
+                full_md_lines.insert(heading_index + 1, new_block)
+
+                block_hash = hash_text(new_block)
+                cursor.execute("INSERT INTO embeddings (id, chunk, embedding) VALUES (?, ?, ?)", (
+                    block_hash,
+                    new_block,
+                    serialize_vector(new_block_emb.flatten())
+                ))
+                conn.commit()
+                faiss_index.add(new_block_emb)
+
+            except StopIteration:
+                print(f"Warning: Heading '{normalized_heading}' not found in toc/full.md. Skipping.")
+        else:
+            i += 1
 
 with full_md_path.open("w", encoding="utf-8") as f:
     f.writelines(full_md_lines)
