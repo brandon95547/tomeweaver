@@ -6,3 +6,5 @@ embeddings.db
 faiss.index
 tmp
 toc/*
+venv
+.venv

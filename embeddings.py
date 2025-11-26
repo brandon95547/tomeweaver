@@ -15,8 +15,8 @@ import numpy as np
 import requests
 import faiss
 
-from config import Config
-from utils import serialize_vector, deserialize_vector, hash_text
+from .config import Config
+from .utils import serialize_vector, deserialize_vector, hash_text
 
 
 class EmbeddingStore:

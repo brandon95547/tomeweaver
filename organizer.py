@@ -11,8 +11,8 @@ Coordinates:
 import re
 from typing import List, Any
 
-from toc_manager import TocManager
-from embeddings import EmbeddingStore
+from .toc_manager import TocManager
+from .embeddings import EmbeddingStore
 
 
 # ---------- Prompt builder ----------

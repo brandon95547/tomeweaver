@@ -1,288 +1,291 @@
-# 📚 Tome Weaver Organizer Pipeline
+# TomeWeaver
 
-*A modular Python system for processing large text files, organizing content into a structured Table of Contents, deduplicating via embeddings, and updating a master markdown document.*
+TomeWeaver is a research/book reorganization engine designed to take long-form source material (books, PDFs converted to text, notes, etc.) and transform it into a structured, query-friendly "investigation" with an AI-generated table of contents (TOC), section files, and embeddings for retrieval.
 
----
-
-## 🚀 Overview
-
-This project takes a large raw text file (ex: book content, scanned OCR text, research dumps), breaks it into chunks, sends each chunk to an LLM with a Table of Contents-aware prompt, and inserts the structured content back into `toc/full.md`.
-
-All inserted blocks are embedded with Hugging Face sentence-transformers, deduplicated using FAISS, and stored in SQLite.
-
-The result:
-✔️ Cleanly organized, structured markdown
-✔️ No duplicate sections
-✔️ Fully automated TOC-guided book building
+It is the core engine that will power the TomeWeaver SaaS on **Synexis AI**.
 
 ---
 
-## 🧱 Project Structure
+## Features
 
-```
-project/
-│
-├── main.py
-├── config.py
-├── embeddings.py
-├── toc_manager.py
-├── organizer.py
-├── utils.py
-│
-└── toc/
-    └── full.md
-```
-
-Each module is responsible for one clean, isolated part of the workflow.
+- 🔁 **End-to-end pipeline**: from raw text → AI-generated TOC → organized sections → embeddings.
+- 🧠 **DeepSeek-powered**: uses DeepSeek for TOC generation and content organization.
+- 🧩 **Chunking & deduplication**: splits large text into chunks and avoids near-duplicate headings using embeddings.
+- 📚 **Markdown output**:
+  - `toc/full.md` — master table of contents.
+  - Per-heading Markdown files for each top-level section.
+- 🔎 **Embeddings & search-ready**:
+  - Uses FAISS + SQLite for vector storage.
+  - Ready for retrieval / question-answering layers on top.
+- 🧱 **Modular architecture** (config, embeddings, TOC generation, organization, utilities).
+- 🚀 **Package-first design**: runs as a Python module via `python -m tomeweaver`.
 
 ---
 
-## 🔧 Core Files and Responsibilities
+## Project Structure
 
-### **1. config.py**
+_(Adjust this to match your actual layout if needed.)_
 
-Loads environment variables, initializes:
+```text
+tomeweaver/
+  __init__.py
+  __main__.py         # Module entrypoint → calls main()
+  main.py             # Orchestrates the full pipeline
 
-* DeepSeek/OpenAI client
-* Hugging Face endpoint + keys
-* Global config values (dimensions, threshold)
+  config.py           # Config & environment loading (Config)
+  embeddings.py       # EmbeddingStore (FAISS + SQLite integration)
+  toc_manager.py      # TocManager for reading/manipulating toc/full.md
+  toc_generator.py    # TocGenerator for building TOC from raw text
+  organizer.py        # ChunkOrganizer & prompt building logic
+  utils.py            # Helper utilities (I/O, chunking, etc.)
 
-This file defines:
+data/
+  input/              # Raw input text files (e.g. source.txt)
+  output/             # Optional: organized output (if used)
+toc/
+  full.md             # Generated master TOC
+  *.md                # Per-heading TOC files
 
-```python
-Config
-```
-
-Used across all other modules.
-
----
-
-### **2. embeddings.py**
-
-Handles all embedding work:
-
-* SQLite table creation
-* FAISS index building
-* Hugging Face embedding API calls
-* Duplicate detection
-* Adding new blocks into DB + FAISS
-
-Defines:
-
-```python
-EmbeddingStore
-```
+requirements.txt
+.env.example
+README.md
+````
 
 ---
 
-### **3. toc_manager.py**
+## Requirements
 
-Manages `toc/full.md`:
+* Python **3.10+** (recommended 3.11+)
+* `pip` and `virtualenv` (or `python -m venv`)
+* DeepSeek API key
+* Basic build tools for FAISS (if not using a precompiled wheel)
 
-* Loads file
-* Extracts headings
-* Checks if a heading exists
-* Inserts content directly under specific TOC headings
-* Saves the updated file
+Core Python dependencies (in `requirements.txt`), e.g.:
 
-Defines:
+* `openai`
+* `python-dotenv`
+* `numpy`
+* `faiss-cpu`
+* `sqlite3` (standard library)
+* Any other libraries you’ve added
 
-```python
-TocManager
+---
+
+## Installation
+
+From the project root:
+
+```bash
+# 1. Create and activate a virtual environment
+python -m venv .venv
+source .venv/bin/activate       # Linux/macOS
+# .venv\Scripts\activate        # Windows (PowerShell/CMD)
+
+# 2. Install dependencies
+pip install -r requirements.txt
 ```
 
 ---
 
-### **4. organizer.py**
+## Configuration
 
-This is the "brain" of the pipeline:
+TomeWeaver uses a `.env` file loaded via `python-dotenv`.
 
-* Builds the LLM prompt using the existing TOC
-* Sends each chunk of text to DeepSeek
-* Parses returned markdown headings
-* For each heading:
+Create your `.env` (or copy from the example):
 
-  * Validates heading against ToC
-  * Embeds the block
-  * Deduplicates via FAISS
-  * Inserts into TOC + DB
-
-Defines:
-
-```python
-ChunkOrganizer
-build_prompt_template()
+```bash
+cp .env.example .env
 ```
+
+Then set the required variables inside `.env`:
+
+```env
+# DeepSeek
+DEEPSEEK_API_KEY=YOUR_DEEPSEEK_API_KEY
+
+# Optional / project-specific settings:
+# Path to SQLite DB (or leave default if handled in Config)
+SQLITE_DB_PATH=./tomeweaver.db
+
+# Embedding model identifier (if your EmbeddingStore uses this)
+EMBEDDING_MODEL=text-embedding-3-small
+
+# Input text file (can be overridden by Config logic)
+INPUT_TEXT_PATH=./data/input/source.txt
+
+# Similarity threshold for heading deduplication
+SIMILARITY_THRESHOLD=0.85
+```
+
+The `Config` class in `config.py` is responsible for:
+
+* Reading the environment variables.
+* Initializing the DeepSeek client:
+
+  * `openai.OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com")`
+* Setting defaults for input paths, DB paths, thresholds, etc.
 
 ---
 
-### **5. utils.py**
+## How to Run TomeWeaver
 
-Pure helper functions:
+TomeWeaver is designed to run as a Python module.
 
-* `hash_text()`
-* `serialize_vector()`
-* `deserialize_vector()`
-* `load_text()`
-* `split_text_into_chunks()`
+From the project root (where the `tomeweaver/` package directory lives):
 
-No dependencies, used by multiple modules.
+```bash
+#when this is not created
+cd sites/tomeweaver
+python -m venv venv
+
+cd /home/bro/sites          # <-- parent directory
+source tomeweaver/.venv/bin/activate
+pip install -r tomeweaver/requirements.txt
+python -m tomeweaver
+
+
+```
+
+This will:
+
+1. Load configuration and environment variables.
+2. Initialize the embeddings store (SQLite + FAISS).
+3. Load the raw input text (e.g. from `INPUT_TEXT_PATH`).
+4. Generate or refresh the table of contents (TOC).
+5. Split the text into chunks.
+6. Organize chunks into sections aligned to the TOC using DeepSeek.
+7. Persist organized content and embeddings.
 
 ---
 
-## 🏃‍♂️ Execution Flow
+## Pipeline / Data Flow
 
-Below is the **full end-to-end pipeline**, exactly how the script runs.
+Here’s the high-level flow implemented in `main.py` and the supporting classes:
 
-### **1. Load environment + create core services**
+1. **Bootstrap configuration and services**
 
-```python
-config = Config.from_env()
-embedding_store = EmbeddingStore(config)
-toc = TocManager("toc/full.md")
-```
+   * `Config.from_env()` reads `.env` and sets up:
 
-➡️ DeepSeek client initialized
-➡️ Hugging Face ready
-➡️ SQLite table ensured
-➡️ FAISS loaded with existing embeddings
-➡️ TOC headings loaded
+     * DeepSeek client
+     * Paths
+     * Similarity thresholds
+   * `EmbeddingStore` initializes FAISS + SQLite.
 
----
+2. **Load raw source text**
 
-### **2. Load & split input text**
+   * `utils.load_text(INPUT_TEXT_PATH)` loads the main input file (e.g., combined book text).
 
-```python
-full_text = load_text("tmp/pizza.txt")
-chunks = split_text_into_chunks(full_text, max_chars=10000)
-```
+3. **Generate / refresh TOC**
 
-➡️ Long text broken into manageable chunks
-➡️ Clean chunk boundaries (sentence → newline → hard cut)
+   * `TocGenerator`:
 
----
+     * Splits the full text into manageable chunks.
+     * Uses DeepSeek to propose candidate headings per chunk.
+     * Converts each heading into embeddings, deduplicates similar ones using cosine similarity.
+     * Builds a coherent Markdown TOC using DeepSeek again.
+     * Writes:
 
-### **3. Build prompt based on the current TOC**
+       * `toc/full.md` (master TOC)
+       * Individual per-heading TOC files in `./toc`.
 
-```python
-prompt_template = build_prompt_template(toc)
-```
+4. **Load TOC for organization**
 
-Prompt contains:
+   * `TocManager("toc/full.md")` parses the Markdown TOC and provides an interface for matching/attaching content.
 
-* Full list of TOC headings
-* Editor instructions
-* Markdown output requirements
-* `{chunk}` placeholder
+5. **Chunk the source text**
 
----
+   * `utils.split_text_into_chunks(full_text, max_chars=...)` splits the full text into working units for AI calls.
 
-### **4. Send each chunk to DeepSeek LLM**
+6. **Organize chunks into sections**
 
-```python
-organizer = ChunkOrganizer(config.deepseek_client, toc, embedding_store, prompt_template)
-organized_sections = organizer.organize_chunks(chunks)
-```
+   * `ChunkOrganizer`:
 
-DeepSeek returns structured markdown for each chunk:
+     * Builds prompts using `build_prompt_template(toc)` that give DeepSeek the TOC context.
+     * Sends each chunk to DeepSeek with instructions on:
 
-```
-# Part Title
-- Important bullet
-- Another detail
+       * Which headings it relates to.
+       * How to position content in the investigation.
+     * Returns a structured list of "organized sections".
 
-# Another Heading
-Paragraphs...
-```
+7. **Insert sections + embeddings**
+
+   * `ChunkOrganizer.insert_sections(organized_sections)`:
+
+     * Writes organized content out (Markdown or into DB, depending on your implementation).
+     * Creates and stores embeddings linked to section IDs / titles in FAISS + SQLite.
 
 ---
 
-### **5. Parse & insert structured sections**
+## Regenerating the TOC
 
-```python
-organizer.insert_sections(organized_sections)
+By default, the main pipeline calls the TOC generator as part of the flow.
+
+If you maintain `generate_toc.py` as a lightweight wrapper, you can regenerate the TOC alone:
+
+```bash
+python generate_toc.py
 ```
 
-For each organized section:
+But in the integrated architecture, the recommended way is simply:
 
-1. Detect headings
-2. Ensure heading exists in TOC
-3. Collect block text
-4. Embed via Hugging Face
-5. Use FAISS to detect duplicates
-6. If unique:
+```bash
+python -m tomeweaver
+```
 
-   * Insert into TOC markdown under the correct heading
-   * Insert embedding into SQLite
-   * Add vector to FAISS
-
-The updated `toc/full.md` is saved at the end.
+You can later add a flag (e.g. `--regen-toc` or `--skip-toc`) via a CLI layer, but that’s outside the core engine.
 
 ---
 
-## 🔄 High-Level Flowchart
+## Development Notes
 
-```
-Load Config → Init Embeddings → Init TOC
-        ↓
-Load Input Text → Split into Chunks
-        ↓
-Build Prompt Template
-        ↓
-[ For Each Chunk ]
-    → Send to DeepSeek
-    → Receive structured markdown
-        ↓
-Parse Organized Output
-Validate Heading
-Get Embedding
-Check Duplicate
-Insert Block (TOC + DB + FAISS)
-        ↓
-Save Updated toc/full.md
-```
+* **Package entrypoint**:
+  `tomeweaver/__main__.py` should look roughly like:
 
----
+  ```python
+  from .main import main
 
-## 🧪 Running the Pipeline
+  if __name__ == "__main__":
+      main()
+  ```
 
-Make sure your `.env` contains:
+* **Main orchestrator**:
+  `main()` in `main.py` wires together:
 
-```
-DEEPSEEK_API_KEY=your_key_here
-HUGGINGFACE_API_KEY=your_key_here
-```
+  * `Config`
+  * `EmbeddingStore`
+  * `TocGenerator`
+  * `TocManager`
+  * `ChunkOrganizer`
+  * Utility functions (load text, splitting, etc.)
 
-Then run:
+* **Extensibility ideas**:
 
-```
-python3 main.py
-```
+  * Add CLI arguments (e.g. input path, output path, toggle TOC regeneration).
+  * Support multiple input documents.
+  * Export JSON metadata for sections to feed into your SaaS frontend.
 
 ---
 
-## ✔️ Output
+## Using TomeWeaver in a SaaS Context
 
-* Updated `toc/full.md` with new content under correct headings
-* `embeddings.db` populated with unique content
-* `faiss.index` updated in-memory
-* No duplicate sections added
+For your Synexis AI platform, TomeWeaver can be wrapped in:
+
+* A **FastAPI / Flask / Django** HTTP API that:
+
+  * Accepts uploads or text.
+  * Triggers the TomeWeaver pipeline.
+  * Stores results in a shared DB / object storage.
+* A **task queue** (RQ, Celery, etc.) for long-running jobs.
+* A **frontend** that:
+
+  * Displays the generated TOC.
+  * Lets users navigate through sections.
+  * Performs semantic search using stored embeddings.
+
+This README documents the **core engine**. The SaaS wrapper can be described in a separate `docs/` section later.
 
 ---
 
-## ❤️ Summary
+## License
 
-This structure gives you:
-
-* Maximum clarity
-* Full modularity
-* Easy debugging
-* Clean separation of concerns
-* A readable `main.py` that tells the full story
-
-If you want, I can also add:
-
-* Logging instead of print statements
-* Progress bars
-* CLI arguments (`--input`, `--toc`, etc.)
-* Unit tests
+*Add your chosen license here (MIT, proprietary, etc.).*
