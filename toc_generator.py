@@ -3,10 +3,11 @@
 """
 toc_generator.py
 
-Builds a candidate TOC from raw book text using DeepSeek + embeddings,
-and writes:
+Builds a candidate Table of Contents (TOC) from raw book text using DeepSeek + local
+embeddings, and writes ONLY:
 - toc/full.md
-- one .md file per top-level heading in ./toc
+
+No per-heading markdown files are created in this version.
 """
 
 from pathlib import Path
@@ -15,19 +16,20 @@ from typing import List, Set
 import numpy as np
 import re
 
-from .config import Config
-from .embeddings import EmbeddingStore
 from .utils import split_text_into_chunks
+from .embeddings import EmbeddingStore
 
 
 class TocGenerator:
-    def __init__(self, config: Config, embedding_store: EmbeddingStore):
+    def __init__(self, config, embedding_store: EmbeddingStore):
         self.config = config
         self.embedding_store = embedding_store
         self.client = config.deepseek_client
-        self.similarity_threshold = config.similarity_threshold
+        self.similarity_threshold = float(config.similarity_threshold)
 
-    # ---------- Step 1: Extract candidate headings from chunks ----------
+    # ------------------------------------------------------------------
+    # Step 1: Extract headings (DeepSeek + embeddings dedupe)
+    # ------------------------------------------------------------------
 
     def extract_headings(
         self,
@@ -36,8 +38,9 @@ class TocGenerator:
     ) -> List[str]:
         """
         Use DeepSeek to extract candidate headings from each text chunk,
-        dedupe them using embeddings, and return a flat list of unique headings.
+        dedupe using cosine similarity, return a unique flat list.
         """
+
         chunks = split_text_into_chunks(full_text, max_chars=max_chars_per_chunk)
         print(f"[TOC] Split text into {len(chunks)} chunks for heading extraction.")
 
@@ -59,6 +62,7 @@ class TocGenerator:
 
         for idx, chunk in enumerate(chunks, start=1):
             print(f"[TOC] Processing chunk {idx}/{len(chunks)} for headings...")
+
             prompt = toc_prompt_template.format(chunk=chunk)
 
             response = self.client.chat.completions.create(
@@ -67,31 +71,36 @@ class TocGenerator:
                     {"role": "system", "content": "You are a helpful assistant."},
                     {"role": "user", "content": prompt},
                 ],
-                temperature=0.3,
+                temperature=0.0,
             )
 
-            toc_output = response.choices[0].message.content or ""
-            for line in toc_output.splitlines():
+            result = response.choices[0].message.content
+            if not result:
+                continue
+
+            for line in result.splitlines():
                 stripped = line.strip()
-                if not stripped or not stripped.startswith("#"):
+                if not stripped.startswith("#"):
                     continue
 
-                # Strip hashes for similarity and uniqueness checks
+                # Normalize heading
                 heading_text = stripped.lstrip("#").strip()
                 if not heading_text:
                     continue
 
+                # Embed heading
                 emb = self.embedding_store.get_embedding(heading_text)
                 if emb is None:
                     continue
 
+                # Check duplicates via cosine similarity
                 if any(
-                    self._cosine_similarity(emb, seen) > self.similarity_threshold
-                    for seen in seen_embeddings
+                    self._cosine_similarity(emb, prev) >= self.similarity_threshold
+                    for prev in seen_embeddings
                 ):
-                    # Very similar heading already seen
                     continue
 
+                # Accept heading
                 if heading_text not in heading_texts:
                     heading_texts.add(heading_text)
                     seen_embeddings.append(emb)
@@ -100,7 +109,9 @@ class TocGenerator:
         print(f"[TOC] Collected {len(toc_sections)} unique candidate headings.")
         return toc_sections
 
-    # ---------- Step 2: Ask DeepSeek to build the final TOC markdown ----------
+    # ------------------------------------------------------------------
+    # Step 2: Build final TOC markdown using DeepSeek
+    # ------------------------------------------------------------------
 
     def build_toc_markdown(self, toc_sections: List[str]) -> str:
         if not toc_sections:
@@ -109,17 +120,15 @@ class TocGenerator:
         headings_block = "\n".join(f"- {h}" for h in toc_sections)
 
         final_prompt = (
-            "You are a professional book editor.\n"
-            "Organize the following list of headings into a complete and coherent "
-            "Table of Contents for a structured investigation.\n\n"
+            "You are organizing a non-fiction book's Table of Contents.\n"
+            "Given the following extracted headings, rewrite them into a clean "
+            "Markdown table of contents structure.\n\n"
             "Rules:\n"
-            "- Use only Markdown headings with '#', '##', and '###'.\n"
-            "- Group similar topics under logical Parts and Sections.\n"
-            "- Do NOT change the wording of the headings.\n"
-            "- Each heading should appear only once (no duplicates).\n"
-            "- Preserve the original order as much as possible, but you may group "
-            "and reorder for clarity.\n\n"
-            "Here are the extracted headings:\n\n"
+            "- Use Markdown headings (#, ##, ###).\n"
+            "- Do NOT change the wording of any heading.\n"
+            "- Group logically, but preserve ordering when possible.\n"
+            "- No commentary, only the Markdown TOC.\n\n"
+            "Extracted headings:\n\n"
             f"{headings_block}"
         )
 
@@ -135,50 +144,30 @@ class TocGenerator:
         toc_md = response.choices[0].message.content or ""
         return toc_md.strip() + "\n"
 
-    # ---------- Step 3: Write toc/full.md and per-heading .md files ----------
+    # ------------------------------------------------------------------
+    # Step 3: Write toc/full.md (only)
+    # ------------------------------------------------------------------
 
     def write_toc_files(self, toc_markdown: str, toc_full_path: str = "toc/full.md") -> None:
         toc_path = Path(toc_full_path)
-        toc_dir = toc_path.parent
-        toc_dir.mkdir(parents=True, exist_ok=True)
 
+        # Ensure directory exists
+        toc_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Write only full.md
         toc_path.write_text(toc_markdown, encoding="utf-8")
-        print(f"[TOC] Wrote full TOC to {toc_path}")
+        print(f"[TOC] Wrote TOC to {toc_path}")
 
-        current_title = None
-        section_lines: List[str] = []
-
-        for line in toc_markdown.splitlines():
-            if line.strip().startswith("#"):
-                # Save the previous section
-                if current_title and section_lines:
-                    filename = self._slugify_heading(current_title)
-                    (toc_dir / f"{filename}.md").write_text(
-                        "\n".join(section_lines) + "\n", encoding="utf-8"
-                    )
-
-                current_title = line
-                section_lines = [line]
-            elif current_title:
-                section_lines.append(line)
-
-        # Save the last section
-        if current_title and section_lines:
-            filename = self._slugify_heading(current_title)
-            (toc_dir / f"{filename}.md").write_text(
-                "\n".join(section_lines) + "\n", encoding="utf-8"
-            )
-
-        print(f"[TOC] Individual TOC files saved in {toc_dir}")
-
-    # ---------- Orchestrator ----------
+    # ------------------------------------------------------------------
 
     def generate_from_text(self, full_text: str, toc_full_path: str = "toc/full.md") -> None:
         toc_sections = self.extract_headings(full_text)
         toc_markdown = self.build_toc_markdown(toc_sections)
         self.write_toc_files(toc_markdown, toc_full_path)
 
-    # ---------- Helpers ----------
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -188,8 +177,3 @@ class TocGenerator:
         if denom == 0.0:
             return 0.0
         return float(a.dot(b) / denom)
-
-    @staticmethod
-    def _slugify_heading(heading_line: str) -> str:
-        title = heading_line.lstrip("#").strip()
-        return re.sub(r"[^a-zA-Z0-9_-]+", "_", title).lower()
