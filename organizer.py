@@ -2,147 +2,282 @@
 organizer.py
 
 Coordinates:
-- Building the LLM prompt using the TOC
+- Building the LLM prompt using the TOC (with stable heading IDs)
 - Sending chunks to DeepSeek for organization
-- Parsing LLM output into heading-based sections
+- Parsing structured JSON output into heading-based sections
 - Using EmbeddingStore + TocManager to dedupe and insert blocks
+
+This version assumes:
+- toc/full.md was produced by `toc_generator.py` and contains ONLY headings
+  of the form:
+
+    # [H1] Origins of the Theory
+    ## [H1.1] Early Online Discussions
+    ### [H1.1.1] Specific Forum Threads
+
+- TocManager knows how to:
+    - render the outline for prompts (`render_outline_for_prompt()`)
+    - insert a markdown block under a heading by ID (`insert_block_under_heading_id()`)
+
+Main public API is unchanged:
+
+    - build_prompt_template(...)
+    - ChunkOrganizer(...).organize_chunks(chunks)
+    - ChunkOrganizer(...).insert_sections(sections)
 """
 
-import re
-from typing import List, Any
+from __future__ import annotations
+
+import json
+from typing import Any, Dict, List
 
 from .toc_manager import TocManager
 from .embeddings import EmbeddingStore
 
-
-# ---------- Prompt builder ----------
-
-def build_prompt_template(toc: TocManager) -> str:
+def build_prompt_template(_: Any = None) -> str:
     """
-    Build the prompt template using the existing TOC headings.
-    Matches the behavior of the original inline prompt_template.
-    """
-    toc_headings_list = toc.get_heading_lines()
+    Build the base prompt template used for each chunk.
 
+    The template MUST contain the placeholders {toc_outline} and {chunk},
+    which are filled in later with the actual TOC and text chunk.
+    """
     return (
-        "You are a professional book editor working with the following existing Table of Contents:\n"
-        + "\n".join(toc_headings_list)
-        + "\n\nYour task is to read the provided raw text and do the following:\n"
-        "1. Identify ALL headings and subheadings from the Table of Contents that are relevant to this chunk.\n"
-        "2. For each relevant heading, organize the chunk’s content underneath it using logical structure (PART > Chapter > Subsection > Bullet points).\n"
-        "3. Repeat this for each matching heading, if applicable.\n"
-        "4. Do NOT invent new top-level sections or change the original ToC.\n"
-        "5. Use markdown formatting consistently.\n\n"
-        "Output format:\n"
-        "# Matching TOC Heading A\n"
-        "(structured info here...)\n\n"
-        "# Matching TOC Heading B\n"
-        "(more structured info...)\n\n"
-        "Text: {chunk}"
+        "You are an organizer, not a writer. Your job is to take messy source text\n"
+        "and map it into an EXISTING outline (Table of Contents).\n\n"
+        "The outline is given as Markdown headings, each with a stable ID in square\n"
+        "brackets, for example:\n"
+        "  # [H1] Origins of the Theory\n"
+        "  ## [H1.1] Early Online Discussions\n"
+        "  ## [H1.2] Historical Parallels\n\n"
+        "You MUST NOT invent new heading IDs. You MUST ONLY use the IDs provided.\n"
+        "You MUST NOT express any opinion or decide which claim is true.\n"
+        "You are allowed to:\n"
+        "- Fix grammar and clarity.\n"
+        "- Reorder sentences within a block for readability.\n"
+        "- Lightly compress or expand text as long as you do not add or remove\n"
+        "  factual claims.\n\n"
+        "TABLE OF CONTENTS (IDs + headings):\n"
+        "{toc_outline}\n"
+        "END OF TOC\n\n"
+        "SOURCE CHUNK:\n"
+        "{chunk}\n"
+        "END OF CHUNK\n\n"
+        "TASK:\n"
+        "1. Decide which heading IDs from the TOC this chunk belongs under.\n"
+        "2. For each relevant heading ID, produce a cleaned version of the text that\n"
+        "   should appear under that heading.\n"
+        "3. If the chunk clearly contains multiple viewpoints or theories under the\n"
+        "   same heading, split them into separate entries and give each a short\n"
+        "   `subheading` label (e.g. 'Military involvement theory', 'Foreign\n"
+        "   intelligence theory').\n"
+        "4. Do NOT synthesize your own overall conclusion; just organize and tidy the\n"
+        "   existing content.\n\n"
+        "OUTPUT FORMAT (VERY IMPORTANT):\n"
+        "Return ONLY valid JSON with this exact structure:\n\n"
+        "{{\n"
+        "  \"sections\": [\n"
+        "    {{\n"
+        "      \"heading_id\": \"H2.1\",   // one of the IDs from the TOC\n"
+        "      \"subheading\": \"Optional label for this viewpoint or angle\",\n"
+        "      \"text\": \"Cleaned paragraph(s) that belong under this heading\"\n"
+        "    }},\n"
+        "    {{\n"
+        "      \"heading_id\": \"H2.1\",\n"
+        "      \"subheading\": \"Another theory under the same heading\",\n"
+        "      \"text\": \"...\"\n"
+        "    }}\n"
+        "  ]\n"
+        "}}\n\n"
+        "Rules:\n"
+        "- If the chunk does not clearly belong anywhere, return {{\"sections\": []}}.\n"
+        "- Do NOT include any explanation outside the JSON.\n"
+        "- Do NOT wrap the JSON in Markdown code fences.\n"
     )
 
-
-# ---------- ChunkOrganizer ----------
-
 class ChunkOrganizer:
+    """
+    Orchestrates the second pass:
+
+    - For each text chunk, call DeepSeek with a TOC-aware prompt.
+    - Parse JSON to get mappings of chunk -> heading IDs.
+    - Insert cleaned blocks under the correct headings in toc/full.md.
+    """
+
     def __init__(
         self,
         client: Any,
         toc: TocManager,
         embedding_store: EmbeddingStore,
         prompt_template: str,
-    ):
-        """
-        client: DeepSeek/OpenAI-compatible client instance
-        toc: TocManager instance
-        embedding_store: EmbeddingStore instance
-        prompt_template: format-string with {chunk} placeholder
-        """
+    ) -> None:
         self.client = client
         self.toc = toc
         self.embedding_store = embedding_store
         self.prompt_template = prompt_template
-        self.heading_pattern = re.compile(r"^(#+)\s+(.*)")
 
-    # ---------- LLM step ----------
+    # ------------------------------------------------------------------
+    # Public entry points
+    # ------------------------------------------------------------------
 
-    def organize_chunks(self, chunks: List[str]) -> List[str]:
+    def organize_chunks(self, chunks: List[str]) -> List[Dict[str, Any]]:
         """
-        Send each chunk to DeepSeek and collect the organized markdown responses.
+        For each chunk, send it to DeepSeek and get back a list of sections
+        of the form:
+
+            {
+              "heading_id": "H1.2",
+              "subheading": "optional label",
+              "text": "cleaned text ..."
+            }
+
+        Returns a flat list of these section dicts across all chunks.
         """
-        organized_sections: List[str] = []
+        all_sections: List[Dict[str, Any]] = []
 
-        for i, chunk in enumerate(chunks):
-            print(f"Processing chunk {i + 1}/{len(chunks)}...")
-
-            prompt = self.prompt_template.format(chunk=chunk)
-            response = self.client.chat.completions.create(
-                model="deepseek-chat",
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.3,
-            )
-
-            organized_output = response.choices[0].message.content
-            organized_sections.append(organized_output)
-
-        return organized_sections
-
-    # ---------- Insert sections into TOC + embeddings ----------
-
-    def insert_sections(self, organized_sections: List[str]):
-        for section in organized_sections:
-            self._process_section(section)
-
-        # After all sections processed, save TOC once
-        self.toc.save()
-
-    def _process_section(self, section: str):
-        lines = section.strip().splitlines()
-        i = 0
-
-        while i < len(lines):
-            match = self.heading_pattern.match(lines[i])
-            if not match:
-                i += 1
+        for idx, chunk in enumerate(chunks, start=1):
+            chunk = (chunk or "").strip()
+            if not chunk:
                 continue
 
-            _, heading_text = match.groups()
-            normalized_heading = heading_text.strip()
+            print(f"[ORG] Processing chunk {idx}/{len(chunks)} ({len(chunk)} chars)...")
 
-            # Collect all lines under this heading until the next heading
-            content_lines = []
-            i += 1
-            while i < len(lines) and not self.heading_pattern.match(lines[i]):
-                content_lines.append(lines[i])
-                i += 1
+            prompt = self._build_prompt(chunk)
+            raw_content = self._call_llm(prompt)
+            if not raw_content:
+                print("  -> Empty response from LLM, skipping.")
+                continue
 
-            # Verify heading exists in original ToC
-            if not self.toc.has_heading(normalized_heading):
-                print(
-                    f"Warning: Heading '{normalized_heading}' not found in toc/full.md. Skipping."
+            json_str = self._extract_json(raw_content)
+            if not json_str:
+                print("  -> Could not locate JSON in LLM response, skipping.")
+                continue
+
+            try:
+                payload = json.loads(json_str)
+            except json.JSONDecodeError as e:
+                print(f"  -> JSON decode error: {e}, skipping.")
+                continue
+
+            sections = payload.get("sections") or []
+            if not isinstance(sections, list):
+                print("  -> 'sections' is not a list; skipping.")
+                continue
+
+            for sec in sections:
+                if not isinstance(sec, dict):
+                    continue
+                heading_id = (sec.get("heading_id") or "").strip()
+                text = (sec.get("text") or "").strip()
+                subheading = (sec.get("subheading") or "").strip()
+
+                if not heading_id or not text:
+                    continue
+
+                all_sections.append(
+                    {
+                        "heading_id": heading_id,
+                        "text": text,
+                        "subheading": subheading or None,
+                    }
                 )
-                continue
 
-            # Build block text exactly like the original script
-            new_block = "\n" + "\n".join(content_lines).strip() + "\n"
-            print(f"new_block -- {new_block}")
+        print(f"[ORG] Collected {len(all_sections)} section blocks from LLM.")
+        return all_sections
 
-            # Get embedding
-            emb = self.embedding_store.get_embedding(new_block)
+    def insert_sections(self, sections: List[Dict[str, Any]]) -> None:
+        """
+        Insert the organized sections into toc/full.md, under the correct
+        headings, while deduplicating with FAISS via EmbeddingStore.
+        """
+        for sec in sections:
+            heading_id = sec["heading_id"]
+            text = sec["text"]
+            subheading = sec.get("subheading")
+
+            # Build the markdown block that will be inserted under this heading.
+            block_lines: List[str] = []
+
+            if subheading:
+                # Use a level-4 heading for sub-headings, but DO NOT include
+                # any heading ID here – IDs are only for the main TOC headings.
+                block_lines.append(f"#### {subheading}\n\n")
+
+            block_lines.append(text.strip() + "\n\n")
+            block = "".join(block_lines)
+
+            emb = self.embedding_store.get_embedding(block)
             if emb is None:
-                print("-> Skipping new_block due to embedding error.")
+                print(f"-> Skipping block for {heading_id} due to embedding error.")
                 continue
 
-            # Duplicate check via FAISS
             if self.embedding_store.is_duplicate(emb):
-                print(
-                    f"-> Skipping new_block under '{normalized_heading}' (FAISS duplicate)"
-                )
+                print(f"-> Skipping block for {heading_id} (FAISS duplicate).")
                 continue
 
-            # Insert into TOC + DB/FAISS
-            self.toc.insert_block_under_heading(normalized_heading, new_block)
-            self.embedding_store.add_block(new_block, emb)
+            # Insert into TOC under the given heading ID and register with FAISS.
+            self.toc.insert_block_under_heading_id(heading_id, block)
+            self.embedding_store.add_block(block, emb)
+
+        # Persist changes to toc/full.md
+        self.toc.save()
+        print("[ORG] Finished inserting sections into toc/full.md.")
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_prompt(self, chunk: str) -> str:
+        """
+        Inject the current TOC (with IDs) and the text chunk into the
+        prompt template.
+        """
+        toc_outline = self.toc.render_outline_for_prompt()
+        return self.prompt_template.format(toc_outline=toc_outline, chunk=chunk)
+
+    def _call_llm(self, prompt: str) -> str:
+        """
+        Make a chat.completions call to DeepSeek and return the raw message text.
+        """
+        response = self.client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert organizer and copy-editor. "
+                        "You NEVER add new facts or personal opinions."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+        )
+
+        message = response.choices[0].message
+        return (getattr(message, "content", None) or "").strip()
+
+    @staticmethod
+    def _extract_json(raw: str) -> str | None:
+        """
+        Try to extract a JSON object from the LLM output.
+
+        The model may sometimes add stray text or Markdown fences, so we:
+        - Look for the first '{' and the last '}'.
+        - Extract that substring and hope it's valid JSON.
+
+        If nothing plausible is found, return None.
+        """
+        if not raw:
+            return None
+
+        raw_strip = raw.strip()
+        if raw_strip.startswith("{") and raw_strip.endswith("}"):
+            return raw_strip
+
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return None
+
+        candidate = raw[start : end + 1].strip()
+        return candidate or None

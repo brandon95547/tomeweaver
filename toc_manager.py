@@ -1,120 +1,214 @@
+# toc_manager.py
+
 """
 toc_manager.py
 
-Manages:
-- Loading and parsing toc/full.md
-- Tracking headings
-- Inserting new content blocks under specific headings
+Manages the TOC markdown file (typically toc/full.md) that now has the form:
 
-All paths are resolved relative to the tomeweaver package directory so that
-running `python -m tomeweaver` from a parent folder (e.g. `sites/`) still
-reads/writes `tomeweaver/toc/full.md`.
+    # [H1] Origins of the Theory
+    ## [H1.1] Early Online Discussions
+    ### [H1.1.1] Specific Forum Threads
+
+This class provides:
+
+- render_outline_for_prompt():
+    Returns only the heading lines (with IDs) as a string, suitable
+    for injecting into the LLM prompt.
+
+- insert_block_under_heading_id(heading_id, block):
+    Inserts an arbitrary markdown block immediately *after* the
+    content for a given heading, but before the next heading of the
+    same or higher level.
+
+- save():
+    Writes the updated markdown back to disk.
+
+Notes:
+- We treat headings as the spine; any non-heading lines in the file
+  are considered content under the most recent heading.
 """
 
-from pathlib import Path
-from typing import List, Set
+from __future__ import annotations
 
-# The directory that contains this file (i.e. the tomeweaver package root)
-BASE_DIR = Path(__file__).resolve().parent
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+
+# Regex for headings of the form:
+#   ## [H1.2] Some Title
+HEADING_RE = re.compile(
+    r"^(#{1,6})\s+\[(H[0-9\.]+)\]\s+(.*\S.*)$"
+)
+
+
+@dataclass
+class HeadingInfo:
+    heading_id: str
+    level: int
+    title: str
+    line_index: int  # index in self.lines
 
 
 class TocManager:
-    def __init__(self, path: str = "toc/full.md"):
-        """
-        `path` is treated as relative to the tomeweaver package directory
-        unless it is an absolute path.
-        """
-        raw_path = Path(path)
-        if raw_path.is_absolute():
-            self.path = raw_path
-        else:
-            self.path = BASE_DIR / raw_path
-
-        self.lines: List[str] = []
-        self._heading_lines: List[str] = []
-        self._heading_set: Set[str] = set()
-
-        self.load()
-
-    # ---------- Load + internal cache ----------
-
-    def load(self) -> None:
-        """
-        Load toc/full.md into memory and build heading caches.
-        If the file does not exist yet, initialize an empty document.
-        """
+    def __init__(self, path: str = "toc/full.md") -> None:
+        self.path = Path(path)
         if not self.path.exists():
-            # Ensure parent directory exists, but keep the document empty
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.lines = []
-            self._heading_lines = []
-            self._heading_set = set()
-            return
+            raise FileNotFoundError(f"TOC file not found: {self.path}")
 
         text = self.path.read_text(encoding="utf-8")
-        self.lines = text.splitlines(keepends=True)
-        self._refresh_heading_cache()
+        # Keep the raw lines in memory so we can insert content.
+        self.lines: List[str] = text.splitlines(keepends=True)
+        self._rebuild_heading_index()
 
-    def _refresh_heading_cache(self) -> None:
-        """
-        Rebuild the heading list and set from self.lines.
-        """
-        self._heading_lines = [
-            line.strip()
-            for line in self.lines
-            if line.strip().startswith("#")
-        ]
-        self._heading_set = {
-            line.lstrip("#").strip()
-            for line in self._heading_lines
-        }
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
 
-    # ---------- Heading info ----------
+    @classmethod
+    def load(cls, path: str = "toc/full.md") -> "TocManager":
+        """
+        Convenience constructor; some legacy code may expect this.
+        """
+        return cls(path)
 
-    def get_heading_lines(self) -> List[str]:
+    def render_outline_for_prompt(self) -> str:
         """
-        Return all headings (with their leading '#' preserved) as a list.
-        """
-        return list(self._heading_lines)
+        Return ONLY the heading lines (with IDs) as a single string.
 
-    def has_heading(self, heading: str) -> bool:
-        """
-        Return True if a heading with this text exists (ignoring leading '#').
-        """
-        return heading in self._heading_set
+        Example:
 
-    # ---------- Insert content ----------
-
-    def insert_block_under_heading(self, heading: str, block: str) -> None:
+            # [H1] Origins of the Theory
+            ## [H1.1] Early Online Discussions
+            ## [H1.2] Historical Parallels
         """
-        Insert `block` immediately after the line that contains the given heading.
+        outline_lines: List[str] = []
 
-        `heading` should be the text without leading '#', matching how headings
-        are stored in toc/full.md. Example: "Introduction", not "# Introduction".
+        for line in self.lines:
+            if HEADING_RE.match(line):
+                # Strip trailing newline for prompt clarity
+                outline_lines.append(line.rstrip("\n"))
+
+        return "\n".join(outline_lines)
+
+    def insert_block_under_heading_id(self, heading_id: str, block: str) -> None:
         """
+        Insert a markdown block under the heading with the given ID.
+
+        - We find the heading line for `heading_id`.
+        - Then we scan forward until we hit:
+            - EOF, or
+            - The next heading with level <= this heading's level.
+        - We insert the block *just before* that boundary.
+
+        If the heading_id is unknown, we silently ignore the request.
+        """
+        info = self._headings_by_id.get(heading_id)
+        if info is None:
+            print(f"[TOC] Warning: heading ID '{heading_id}' not found; skipping insert.")
+            return
+
+        insert_at = self._find_insertion_index(info)
+        # Ensure block ends with a newline
         if not block.endswith("\n"):
             block = block + "\n"
 
-        try:
-            index = next(
-                i
-                for i, line in enumerate(self.lines)
-                if line.strip().startswith("#")
-                and line.lstrip("#").strip() == heading
-            )
-        except StopIteration:
-            print(f"Warning: Heading '{heading}' not found in {self.path}. Skipping.")
-            return
+        block_lines = block.splitlines(keepends=True)
 
-        # Insert block right after the heading line
-        self.lines.insert(index + 1, block)
-        self._refresh_heading_cache()
+        # Insert the new content
+        self.lines[insert_at:insert_at] = block_lines
 
-    # ---------- Save file ----------
+        # After modifying the line list, we must rebuild heading indexes
+        self._rebuild_heading_index()
 
     def save(self) -> None:
         """
-        Write the current lines back to toc/full.md on disk.
+        Persist the updated markdown back to the same file.
         """
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text("".join(self.lines), encoding="utf-8")
+        text = "".join(self.lines)
+        self.path.write_text(text, encoding="utf-8")
+        print(f"[TOC] Saved updated TOC/content to {self.path}")
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _rebuild_heading_index(self) -> None:
+        """
+        Scan self.lines and rebuild:
+          - self._headings: a list of HeadingInfo objects in order
+          - self._headings_by_id: mapping of heading_id -> HeadingInfo
+        """
+        self._headings: List[HeadingInfo] = []
+        self._headings_by_id: Dict[str, HeadingInfo] = {}
+
+        for idx, raw_line in enumerate(self.lines):
+            line = raw_line.rstrip("\n")
+            m = HEADING_RE.match(line)
+            if not m:
+                continue
+
+            hashes, hid, title = m.groups()
+            level = len(hashes)
+
+            info = HeadingInfo(
+                heading_id=hid,
+                level=level,
+                title=title.strip(),
+                line_index=idx,
+            )
+            self._headings.append(info)
+            self._headings_by_id[hid] = info
+
+        print(f"[TOC] Indexed {len(self._headings)} headings from {self.path}")
+
+    def _find_insertion_index(self, info: HeadingInfo) -> int:
+        """
+        Determine the line index where new content under `info` should be inserted.
+
+        Strategy:
+        - Start from the line *after* the heading.
+        - Walk forward until we hit:
+            - EOF, or
+            - A heading whose level <= info.level (i.e., next sibling or parent).
+        - Return the index of that boundary (we insert just before it).
+        """
+        start_idx = info.line_index + 1
+        total_lines = len(self.lines)
+
+        # Precompute a mapping from line index -> (level or None)
+        heading_levels_by_line: Dict[int, int] = {
+            h.line_index: h.level for h in self._headings
+        }
+
+        i = start_idx
+        while i < total_lines:
+            level_at_i = heading_levels_by_line.get(i)
+            if level_at_i is not None and level_at_i <= info.level:
+                # Next heading at same or higher level; insert before this line.
+                return i
+            i += 1
+
+        # If we got here, we hit EOF; insert at end.
+        return total_lines
+
+    # ------------------------------------------------------------------
+    # Optional helpers (if you ever need them later)
+    # ------------------------------------------------------------------
+
+    def get_heading_titles(self) -> List[Tuple[str, str]]:
+        """
+        Return a list of (heading_id, title) tuples in document order.
+        """
+        return [(h.heading_id, h.title) for h in self._headings]
+
+    def find_heading_by_title(self, title: str) -> Optional[HeadingInfo]:
+        """
+        Very simple search by exact title match.
+        """
+        title = title.strip()
+        for h in self._headings:
+            if h.title == title:
+                return h
+        return None

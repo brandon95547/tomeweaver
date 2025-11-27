@@ -136,10 +136,9 @@ From the project root (where the `tomeweaver/` package directory lives):
 ```bash
 #when this is not created
 cd sites/tomeweaver
-python -m venv venv
-
-cd /home/bro/sites          # <-- parent directory
-source tomeweaver/.venv/bin/activate
+python3 -m venv venv
+cd ..
+source tomeweaver/venv/bin/activate
 pip install -r tomeweaver/requirements.txt
 python -m tomeweaver
 
