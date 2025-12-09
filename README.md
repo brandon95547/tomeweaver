@@ -73,19 +73,19 @@ Core Python dependencies (in `requirements.txt`), e.g.:
 
 ## Installation
 
-From the project root:
+### Using the Makefile
 
-```bash
-# 1. Create and activate a virtual environment
-python -m venv .venv
-source .venv/bin/activate       # Linux/macOS
-# .venv\Scripts\activate        # Windows (PowerShell/CMD)
+TomeWeaver includes a Makefile for convenience during development.  
+The Makefile **must be run from the project root**, which is the directory that contains:
 
-# 2. Install dependencies
-pip install -r requirements.txt
-```
+- `Makefile`
+- `requirements.txt`
+- the `tomeweaver/` package folder
 
----
+From the project root (`/sites/tomeweaver/`), run:
+
+make install
+make run
 
 ## Configuration
 
