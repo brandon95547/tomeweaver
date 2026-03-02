@@ -115,6 +115,10 @@ INPUT_TEXT_PATH=./data/input/source.txt
 
 # Similarity threshold for heading deduplication
 SIMILARITY_THRESHOLD=0.85
+
+# Optional pipeline runtime settings
+TOC_FULL_PATH=./tomeweaver/toc/full.md
+MAX_CHUNK_CHARS=10000
 ```
 
 The `Config` class in `config.py` is responsible for:
@@ -143,6 +147,12 @@ pip install -r tomeweaver/requirements.txt
 python -m tomeweaver
 
 
+```
+
+CLI overrides:
+
+```bash
+python -m tomeweaver --input ./data/input/source.txt --toc ./tomeweaver/toc/full.md --max-chars 12000
 ```
 
 This will:
@@ -282,6 +292,27 @@ For your Synexis AI platform, TomeWeaver can be wrapped in:
   * Performs semantic search using stored embeddings.
 
 This README documents the **core engine**. The SaaS wrapper can be described in a separate `docs/` section later.
+
+---
+
+## Minimal FastAPI Wrapper
+
+A lightweight HTTP wrapper is available at `tomeweaver/api.py`.
+
+Run:
+
+```bash
+uvicorn tomeweaver.api:app --reload --host 0.0.0.0 --port 8010
+```
+
+Endpoints:
+
+- `GET /health`
+- `POST /run`
+  - JSON body supports:
+    - `text` (inline text input) OR `input_path` (path to text file)
+    - `toc_full_path` (optional)
+    - `max_chunk_chars` (optional)
 
 ---
 
