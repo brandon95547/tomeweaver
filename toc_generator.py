@@ -47,7 +47,8 @@ class TocGenerator:
         """
 
         chunks = split_text_into_chunks(full_text, max_chars=max_chars_per_chunk)
-        print(f"[TOC] Split text into {len(chunks)} chunks for heading extraction.")
+        target_heading_count = getattr(self.config, "toc_target_heading_count", 60)
+        print(f"[TOC] Split text into {len(chunks)} chunks for heading extraction (target: {target_heading_count} headings).")
 
         seen_embeddings: List[np.ndarray] = []
         heading_texts: Set[str] = set()
@@ -114,7 +115,11 @@ class TocGenerator:
                     seen_embeddings.append(emb)
                     toc_sections.append(heading_text)
 
-        print(f"[TOC] Collected {len(toc_sections)} unique candidate headings.")
+        target_heading_count = getattr(self.config, "toc_target_heading_count", 60)
+        print(f"[TOC] Collected {len(toc_sections)} unique candidate headings (target: {target_heading_count}).")
+        if len(toc_sections) < target_heading_count * 0.7:
+            print(f"[TOC] Warning: heading count ({len(toc_sections)}) is below 70% of target ({target_heading_count}).")
+            print(f"[TOC] This may result in context loss. Consider lowering SIMILARITY_THRESHOLD or raising TOC_TARGET_HEADING_COUNT.")
         return toc_sections
 
     # ------------------------------------------------------------------

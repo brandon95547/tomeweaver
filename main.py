@@ -50,6 +50,8 @@ def run_pipeline(
         toc=toc,
         embedding_store=embedding_store,
         prompt_template=prompt_template,
+        conservative_mode=config.conservative_mode,
+        catchall_heading=config.catchall_heading,
     )
 
     organized_sections = organizer.organize_chunks(chunks)

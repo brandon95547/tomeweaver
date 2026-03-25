@@ -109,11 +109,15 @@ class ChunkOrganizer:
         toc: TocManager,
         embedding_store: EmbeddingStore,
         prompt_template: str,
+        conservative_mode: bool = False,
+        catchall_heading: str = "Miscellaneous",
     ) -> None:
         self.client = client
         self.toc = toc
         self.embedding_store = embedding_store
         self.prompt_template = prompt_template
+        self.conservative_mode = conservative_mode
+        self.catchall_heading = catchall_heading
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -121,18 +125,15 @@ class ChunkOrganizer:
 
     def organize_chunks(self, chunks: List[str]) -> List[Dict[str, Any]]:
         """
-        For each chunk, send it to DeepSeek and get back a list of sections
-        of the form:
+        Two-pass organizing:
+        - Pass 1: Map chunks to existing headings (standard flow).
+        - Pass 2: Re-process unmapped content as new sections under catchall heading.
 
-            {
-              "heading_id": "H1.2",
-              "subheading": "optional label",
-              "text": "cleaned text ..."
-            }
-
-        Returns a flat list of these section dicts across all chunks.
+        Returns a flat list of section dicts across all chunks.
         """
         all_sections: List[Dict[str, Any]] = []
+        unmapped_chunks: List[str] = []
+        conservative = self.conservative_mode
 
         for idx, chunk in enumerate(chunks, start=1):
             chunk = (chunk or "").strip()
@@ -144,25 +145,30 @@ class ChunkOrganizer:
             prompt = self._build_prompt(chunk)
             raw_content = self._call_llm(prompt)
             if not raw_content:
-                print("  -> Empty response from LLM, skipping.")
+                print("  -> Empty response from LLM, tracking for second pass.")
+                unmapped_chunks.append(chunk)
                 continue
 
             json_str = self._extract_json(raw_content)
             if not json_str:
-                print("  -> Could not locate JSON in LLM response, skipping.")
+                print("  -> Could not locate JSON in LLM response, tracking for second pass.")
+                unmapped_chunks.append(chunk)
                 continue
 
             try:
                 payload = json.loads(json_str)
             except json.JSONDecodeError as e:
-                print(f"  -> JSON decode error: {e}, skipping.")
+                print(f"  -> JSON decode error: {e}, tracking for second pass.")
+                unmapped_chunks.append(chunk)
                 continue
 
             sections = payload.get("sections") or []
             if not isinstance(sections, list):
-                print("  -> 'sections' is not a list; skipping.")
+                print("  -> 'sections' is not a list; tracking for second pass.")
+                unmapped_chunks.append(chunk)
                 continue
 
+            chunk_had_mappings = False
             for sec in sections:
                 if not isinstance(sec, dict):
                     continue
@@ -173,6 +179,7 @@ class ChunkOrganizer:
                 if not heading_id or not text:
                     continue
 
+                chunk_had_mappings = True
                 all_sections.append(
                     {
                         "heading_id": heading_id,
@@ -181,14 +188,72 @@ class ChunkOrganizer:
                     }
                 )
 
-        print(f"[ORG] Collected {len(all_sections)} section blocks from LLM.")
+            if not chunk_had_mappings:
+                unmapped_chunks.append(chunk)
+
+        print(f"[ORG] Pass 1 collected {len(all_sections)} section blocks; {len(unmapped_chunks)} chunk(s) unmapped.")
+
+        if unmapped_chunks:
+            print(f"[ORG] Pass 2: Processing {len(unmapped_chunks)} unmapped chunk(s)...")
+            unmapped_sections = self._organize_unmapped_chunks(unmapped_chunks)
+            all_sections.extend(unmapped_sections)
+            print(f"[ORG] Pass 2 added {len(unmapped_sections)} sections from unmapped content.")
+
         return all_sections
+
+    def _organize_unmapped_chunks(self, unmapped_chunks: List[str]) -> List[Dict[str, Any]]:
+        """
+        Second pass: organize unmapped content under the catchall heading.
+        """
+        sections: List[Dict[str, Any]] = []
+        catchall = self.catchall_heading
+
+        for chunk in unmapped_chunks:
+            chunk = (chunk or "").strip()
+            if not chunk:
+                continue
+
+            prompt = (
+                f"You are organizing content that does not fit the main TOC structure.\n"
+                f"Summarize and clean the following chunk into 1-3 short paragraphs suitable for inclusion under '{catchall}'.\n"
+                f"Return ONLY the cleaned text, no explanations.\n\n"
+                f"Chunk:\n{chunk}"
+            )
+
+            try:
+                response = self.client.chat.completions.create(
+                    model="deepseek-chat",
+                    messages=[
+                        {"role": "system", "content": "You are an expert copy-editor. Clean and organize text without adding facts."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.1,
+                )
+                text = (response.choices[0].message.content or "").strip()
+                if text:
+                    sections.append(
+                        {
+                            "heading_id": "CATCHALL",
+                            "text": text,
+                            "subheading": None,
+                        }
+                    )
+            except Exception as e:
+                print(f"  -> Failed to process unmapped chunk: {e}")
+
+        return sections
 
     def insert_sections(self, sections: List[Dict[str, Any]]) -> None:
         """
-        Insert the organized sections into toc/full.md, under the correct
-        headings, while deduplicating with FAISS via EmbeddingStore.
+        Insert organized sections into toc/full.md, optionally deduplicating
+        with FAISS based on conservative_mode config.
         """
+        conservative = self.conservative_mode
+        catchall = self.catchall_heading
+        inserted_count = 0
+        skipped_count = 0
+        total_chars = 0
+
         for sec in sections:
             heading_id = sec["heading_id"]
             text = sec["text"]
@@ -204,23 +269,46 @@ class ChunkOrganizer:
 
             block_lines.append(text.strip() + "\n\n")
             block = "".join(block_lines)
+            block_chars = len(block)
+            total_chars += block_chars
 
-            emb = self.embedding_store.get_embedding(block)
-            if emb is None:
-                print(f"-> Skipping block for {heading_id} due to embedding error.")
+            # Handle catchall sections separately (always insert, no dedup).
+            if heading_id == "CATCHALL":
+                self.toc.insert_block_under_heading_id(catchall, block)
+                inserted_count += 1
                 continue
 
-            if self.embedding_store.is_duplicate(emb):
-                print(f"-> Skipping block for {heading_id} (FAISS duplicate).")
-                continue
+            # For normal sections: apply dedup only if not in conservative mode.
+            if conservative:
+                # Conservative mode: skip dedup and embeddings, keep all content.
+                self.toc.insert_block_under_heading_id(heading_id, block)
+                inserted_count += 1
+            else:
+                emb = self.embedding_store.get_embedding(block)
+                if emb is None:
+                    print(f"-> Skipping block for {heading_id} due to embedding error.")
+                    skipped_count += 1
+                    continue
 
-            # Insert into TOC under the given heading ID and register with FAISS.
-            self.toc.insert_block_under_heading_id(heading_id, block)
-            self.embedding_store.add_block(block, emb)
+                if self.embedding_store.is_duplicate(emb):
+                    print(f"-> Skipping block for {heading_id} (FAISS duplicate).")
+                    skipped_count += 1
+                    continue
+
+                # Insert into TOC under the given heading ID and register with FAISS.
+                self.toc.insert_block_under_heading_id(heading_id, block)
+                self.embedding_store.add_block(block, emb)
+                inserted_count += 1
 
         # Persist changes to toc/full.md
         self.toc.save()
-        print("[ORG] Finished inserting sections into toc/full.md.")
+
+        # Validation logging
+        mode_info = "(conservative: no dedup)" if conservative else "(dedup enabled)"
+        print(f"[ORG] Finished inserting {inserted_count} sections into toc/full.md {mode_info}.")
+        if skipped_count > 0:
+            print(f"[ORG] Skipped {skipped_count} duplicate blocks.")
+        print(f"[ORG] Total content inserted: {total_chars} characters.")
 
     # ------------------------------------------------------------------
     # Internal helpers

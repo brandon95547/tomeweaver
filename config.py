@@ -37,11 +37,14 @@ class Config:
             api_key=api_key,
             base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         )
-        self.similarity_threshold = _get_float_env("SIMILARITY_THRESHOLD", 0.90)
+        self.similarity_threshold = _get_float_env("SIMILARITY_THRESHOLD", 0.75)
         self.dimensions = _get_int_env("EMBEDDING_DIMENSIONS", 384)
         self.input_text_path = os.getenv("INPUT_TEXT_PATH", str(BASE_DIR / "tmp" / "pizza.txt"))
         self.toc_full_path = os.getenv("TOC_FULL_PATH", str(BASE_DIR / "toc" / "full.md"))
         self.max_chunk_chars = _get_int_env("MAX_CHUNK_CHARS", 10000)
+        self.conservative_mode = os.getenv("CONSERVATIVE_MODE", "false").lower() in ("true", "1", "yes")
+        self.catchall_heading = os.getenv("CATCHALL_HEADING", "Miscellaneous")
+        self.toc_target_heading_count = _get_int_env("TOC_TARGET_HEADING_COUNT", 60)
 
     @classmethod
     def from_env(cls):

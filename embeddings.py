@@ -95,7 +95,21 @@ class EmbeddingStore:
         if not rows:
             return index
 
-        vectors = [deserialize_vector(blob) for (blob,) in rows]
+        # Deserialize vectors, filtering out any with incorrect dimensions
+        vectors = []
+        for (blob,) in rows:
+            try:
+                vec = deserialize_vector(blob)
+                if len(vec) == self.dim:
+                    vectors.append(vec)
+                else:
+                    print(f"[WARN] Skipping malformed vector: expected {self.dim} dims, got {len(vec)}")
+            except Exception as e:
+                print(f"[WARN] Failed to deserialize vector: {e}")
+        
+        if not vectors:
+            return index
+
         arr = np.vstack(vectors).astype(np.float32)
 
         # Normalize so inner product = cosine similarity
