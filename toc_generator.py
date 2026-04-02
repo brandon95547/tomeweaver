@@ -16,12 +16,12 @@ Changes vs previous version:
 """
 
 from pathlib import Path
-from typing import List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import re
 
-from .utils import split_text_into_chunks
+from .utils import split_text_into_chunks, split_paragraphs
 from .embeddings import EmbeddingStore
 
 
@@ -268,6 +268,97 @@ class TocGenerator:
         toc_sections = self.extract_headings(full_text)
         toc_markdown = self.build_toc_markdown(toc_sections)
         self.write_toc_files(toc_markdown, toc_full_path)
+
+    # ------------------------------------------------------------------
+    # Step 4: TOC completeness pre-check
+    # ------------------------------------------------------------------
+
+    def check_toc_completeness(
+        self,
+        full_text: str,
+        headings: List[Tuple[str, str]],
+        threshold: float = 0.35,
+    ) -> Dict:
+        """
+        Verify that every paragraph in the original text has at least one
+        plausible heading in the TOC (by embedding similarity).
+
+        This catches structural gaps *before* the organizer runs — if a
+        paragraph's best heading match is below *threshold*, the TOC
+        likely has no home for that content and it will be lost.
+
+        Args:
+            full_text:  The original input text.
+            headings:   List of (heading_id, title) from TocManager.
+            threshold:  Minimum cosine similarity to consider a heading
+                        "plausible" for a paragraph.
+
+        Returns:
+            Dict with:
+                total_paragraphs   – int
+                covered             – int  (paragraphs with a plausible heading)
+                uncovered           – list of (paragraph_text, best_heading_id, best_sim)
+                coverage_ratio      – float in [0, 1]
+        """
+        paragraphs = split_paragraphs(full_text)
+        if not paragraphs or not headings:
+            return {
+                "total_paragraphs": len(paragraphs),
+                "covered": len(paragraphs),
+                "uncovered": [],
+                "coverage_ratio": 1.0,
+            }
+
+        # Pre-compute heading embeddings
+        heading_embs: List[Tuple[str, str, Optional[np.ndarray]]] = []
+        for hid, title in headings:
+            emb = self.embedding_store.get_embedding(title)
+            heading_embs.append((hid, title, emb))
+
+        covered = 0
+        uncovered: List[Tuple[str, str, float]] = []
+
+        for para in paragraphs:
+            para_emb = self.embedding_store.get_embedding(para)
+            if para_emb is None:
+                uncovered.append((para, "", 0.0))
+                continue
+
+            best_id = ""
+            best_sim = -1.0
+            for hid, title, h_emb in heading_embs:
+                if h_emb is None:
+                    continue
+                sim = float(self._cosine_similarity(para_emb, h_emb))
+                if sim > best_sim:
+                    best_sim = sim
+                    best_id = hid
+
+            if best_sim >= threshold:
+                covered += 1
+            else:
+                uncovered.append((para, best_id, best_sim))
+
+        ratio = covered / len(paragraphs) if paragraphs else 1.0
+
+        if uncovered:
+            print(
+                f"[TOC] Completeness pre-check: {covered}/{len(paragraphs)} paragraphs "
+                f"have a plausible heading (threshold={threshold:.2f})."
+            )
+            print(
+                f"[TOC] ⚠️  {len(uncovered)} paragraph(s) may have no structural home "
+                f"in the current TOC. Consider adding headings for better coverage."
+            )
+        else:
+            print(f"[TOC] ✅ Completeness pre-check: all {len(paragraphs)} paragraphs have a plausible heading.")
+
+        return {
+            "total_paragraphs": len(paragraphs),
+            "covered": covered,
+            "uncovered": uncovered,
+            "coverage_ratio": ratio,
+        }
 
     # ------------------------------------------------------------------
     # Helpers

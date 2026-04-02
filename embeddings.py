@@ -9,7 +9,7 @@ Handles:
 
 import sqlite3
 from pathlib import Path
-from typing import Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import faiss
@@ -150,12 +150,12 @@ class EmbeddingStore:
 
     # ---------- Duplicate detection ----------
 
-    def is_duplicate(self, emb: np.ndarray) -> bool:
+    def is_duplicate(self, emb: np.ndarray, threshold: Optional[float] = None) -> bool:
         """
         Check whether `emb` is too similar to something already stored.
 
-        Uses cosine similarity via FAISS inner-product index and
-        `config.similarity_threshold` (e.g., 0.90).
+        Uses cosine similarity via FAISS inner-product index.
+        If *threshold* is provided it overrides ``config.similarity_threshold``.
         """
         if self.index.ntotal == 0:
             return False
@@ -167,7 +167,8 @@ class EmbeddingStore:
         distances, _ = self.index.search(query, k=1)
         best = float(distances[0][0])
 
-        return best >= float(self.config.similarity_threshold)
+        effective = threshold if threshold is not None else float(self.config.similarity_threshold)
+        return best >= effective
 
     # ---------- Insert new block ----------
 
@@ -188,6 +189,40 @@ class EmbeddingStore:
         vec = emb.reshape(1, -1).astype(np.float32)
         faiss.normalize_L2(vec)
         self.index.add(vec)
+
+    # ---------- Nearest-heading lookup ----------
+
+    def find_nearest_heading(
+        self,
+        text_emb: np.ndarray,
+        headings: List[Tuple[str, str]],
+    ) -> Optional[str]:
+        """
+        Return the heading_id whose title embeds closest to *text_emb*.
+
+        Args:
+            text_emb: Normalized embedding of the text to classify.
+            headings: List of ``(heading_id, title)`` pairs from the TOC.
+
+        Returns:
+            The ``heading_id`` of the best match, or ``None``.
+        """
+        if not headings:
+            return None
+
+        best_id: Optional[str] = None
+        best_sim = -1.0
+
+        for heading_id, title in headings:
+            heading_emb = self.get_embedding(title)
+            if heading_emb is None:
+                continue
+            sim = float(np.dot(text_emb, heading_emb))
+            if sim > best_sim:
+                best_sim = sim
+                best_id = heading_id
+
+        return best_id
 
     # ---------- Cleanup ----------
 

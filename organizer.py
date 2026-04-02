@@ -42,20 +42,27 @@ def build_prompt_template(_: Any = None) -> str:
     which are filled in later with the actual TOC and text chunk.
     """
     return (
-        "You are an organizer, not a writer. Your job is to take messy source text\n"
-        "and map it into an EXISTING outline (Table of Contents).\n\n"
+        "You are a content classifier, NOT a writer or editor. Your ONLY job is to\n"
+        "decide which sections of the source text belong under which headings in an\n"
+        "existing Table of Contents, and return the text VERBATIM.\n\n"
         "The outline is given as Markdown headings, each with a stable ID in square\n"
         "brackets, for example:\n"
         "  # [H1] Origins of the Theory\n"
         "  ## [H1.1] Early Online Discussions\n"
         "  ## [H1.2] Historical Parallels\n\n"
-        "You MUST NOT invent new heading IDs. You MUST ONLY use the IDs provided.\n"
-        "You MUST NOT express any opinion or decide which claim is true.\n"
-        "You are allowed to:\n"
-        "- Fix grammar and clarity.\n"
-        "- Reorder sentences within a block for readability.\n"
-        "- Lightly compress or expand text as long as you do not add or remove\n"
-        "  factual claims.\n\n"
+        "STRICT RULES:\n"
+        "- You MUST NOT rewrite, compress, summarize, simplify, or paraphrase ANY text.\n"
+        "- You MUST NOT remove caveats, qualifiers, hedging language, objections,\n"
+        "  rebuttals, examples, rhetorical framing, or 'why this matters' context.\n"
+        "- You MUST NOT invent new heading IDs. Use ONLY the IDs provided.\n"
+        "- You MUST copy text EXACTLY as it appears in the source — word for word,\n"
+        "  punctuation for punctuation.\n"
+        "- If a passage is relevant to multiple headings, include the FULL passage\n"
+        "  under EACH relevant heading.\n"
+        "- If a passage does not clearly belong under any heading, assign it to the\n"
+        "  CLOSEST relevant heading rather than discarding it.\n"
+        "- EVERY sentence in the source chunk MUST appear in your output.\n"
+        "  Do NOT silently drop ANY content.\n\n"
         "TABLE OF CONTENTS (IDs + headings):\n"
         "{toc_outline}\n"
         "END OF TOC\n\n"
@@ -63,33 +70,27 @@ def build_prompt_template(_: Any = None) -> str:
         "{chunk}\n"
         "END OF CHUNK\n\n"
         "TASK:\n"
-        "1. Decide which heading IDs from the TOC this chunk belongs under.\n"
-        "2. For each relevant heading ID, produce a cleaned version of the text that\n"
-        "   should appear under that heading.\n"
-        "3. If the chunk clearly contains multiple viewpoints or theories under the\n"
-        "   same heading, split them into separate entries and give each a short\n"
-        "   `subheading` label (e.g. 'Military involvement theory', 'Foreign\n"
-        "   intelligence theory').\n"
-        "4. Do NOT synthesize your own overall conclusion; just organize and tidy the\n"
-        "   existing content.\n\n"
+        "1. Read every sentence in the source chunk.\n"
+        "2. For each passage (one or more related sentences), decide which heading\n"
+        "   ID it belongs under.\n"
+        "3. Return the passage VERBATIM under that heading ID.\n"
+        "4. If the chunk contains distinct viewpoints or sub-topics under the same\n"
+        "   heading, split them into separate entries with a short `subheading` label.\n"
+        "5. Do NOT leave any source text unassigned.\n\n"
         "OUTPUT FORMAT (VERY IMPORTANT):\n"
         "Return ONLY valid JSON with this exact structure:\n\n"
         "{{\n"
         "  \"sections\": [\n"
         "    {{\n"
-        "      \"heading_id\": \"H2.1\",   // one of the IDs from the TOC\n"
-        "      \"subheading\": \"Optional label for this viewpoint or angle\",\n"
-        "      \"text\": \"Cleaned paragraph(s) that belong under this heading\"\n"
-        "    }},\n"
-        "    {{\n"
         "      \"heading_id\": \"H2.1\",\n"
-        "      \"subheading\": \"Another theory under the same heading\",\n"
-        "      \"text\": \"...\"\n"
+        "      \"subheading\": \"Optional label for this viewpoint or angle\",\n"
+        "      \"text\": \"EXACT verbatim text from the source chunk\"\n"
         "    }}\n"
         "  ]\n"
         "}}\n\n"
         "Rules:\n"
-        "- If the chunk does not clearly belong anywhere, return {{\"sections\": []}}.\n"
+        "- NEVER return {{\"sections\": []}}. Every chunk has content that belongs\n"
+        "  somewhere. If unsure, assign to the closest heading.\n"
         "- Do NOT include any explanation outside the JSON.\n"
         "- Do NOT wrap the JSON in Markdown code fences.\n"
     )
@@ -111,6 +112,7 @@ class ChunkOrganizer:
         prompt_template: str,
         conservative_mode: bool = False,
         catchall_heading: str = "Miscellaneous",
+        content_similarity_threshold: float = 0.95,
     ) -> None:
         self.client = client
         self.toc = toc
@@ -118,6 +120,7 @@ class ChunkOrganizer:
         self.prompt_template = prompt_template
         self.conservative_mode = conservative_mode
         self.catchall_heading = catchall_heading
+        self.content_similarity_threshold = content_similarity_threshold
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -203,43 +206,40 @@ class ChunkOrganizer:
 
     def _organize_unmapped_chunks(self, unmapped_chunks: List[str]) -> List[Dict[str, Any]]:
         """
-        Second pass: organize unmapped content under the catchall heading.
+        Second pass: assign unmapped content VERBATIM to the nearest heading
+        by embedding similarity.  No summarization — preserves full context.
         """
         sections: List[Dict[str, Any]] = []
-        catchall = self.catchall_heading
+        headings = self.toc.get_heading_titles()
 
         for chunk in unmapped_chunks:
             chunk = (chunk or "").strip()
             if not chunk:
                 continue
 
-            prompt = (
-                f"You are organizing content that does not fit the main TOC structure.\n"
-                f"Summarize and clean the following chunk into 1-3 short paragraphs suitable for inclusion under '{catchall}'.\n"
-                f"Return ONLY the cleaned text, no explanations.\n\n"
-                f"Chunk:\n{chunk}"
-            )
+            chunk_emb = self.embedding_store.get_embedding(chunk)
+            if chunk_emb is None:
+                # Cannot embed; fall back to catchall with verbatim text
+                sections.append({
+                    "heading_id": "CATCHALL",
+                    "text": chunk,
+                    "subheading": None,
+                })
+                continue
 
-            try:
-                response = self.client.chat.completions.create(
-                    model="deepseek-chat",
-                    messages=[
-                        {"role": "system", "content": "You are an expert copy-editor. Clean and organize text without adding facts."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.1,
-                )
-                text = (response.choices[0].message.content or "").strip()
-                if text:
-                    sections.append(
-                        {
-                            "heading_id": "CATCHALL",
-                            "text": text,
-                            "subheading": None,
-                        }
-                    )
-            except Exception as e:
-                print(f"  -> Failed to process unmapped chunk: {e}")
+            nearest_id = self.embedding_store.find_nearest_heading(chunk_emb, headings)
+            if nearest_id:
+                sections.append({
+                    "heading_id": nearest_id,
+                    "text": chunk,
+                    "subheading": "Auto-placed (review recommended)",
+                })
+            else:
+                sections.append({
+                    "heading_id": "CATCHALL",
+                    "text": chunk,
+                    "subheading": None,
+                })
 
         return sections
 
@@ -290,8 +290,8 @@ class ChunkOrganizer:
                     skipped_count += 1
                     continue
 
-                if self.embedding_store.is_duplicate(emb):
-                    print(f"-> Skipping block for {heading_id} (FAISS duplicate).")
+                if self.embedding_store.is_duplicate(emb, threshold=self.content_similarity_threshold):
+                    print(f"-> Skipping block for {heading_id} (FAISS duplicate at threshold {self.content_similarity_threshold}).")
                     skipped_count += 1
                     continue
 
@@ -332,8 +332,9 @@ class ChunkOrganizer:
                 {
                     "role": "system",
                     "content": (
-                        "You are an expert organizer and copy-editor. "
-                        "You NEVER add new facts or personal opinions."
+                        "You are a content classifier. You assign source text "
+                        "to headings VERBATIM. You NEVER rewrite, summarize, "
+                        "compress, or paraphrase any text."
                     ),
                 },
                 {"role": "user", "content": prompt},

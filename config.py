@@ -45,6 +45,11 @@ class Config:
         self.conservative_mode = os.getenv("CONSERVATIVE_MODE", "false").lower() in ("true", "1", "yes")
         self.catchall_heading = os.getenv("CATCHALL_HEADING", "Miscellaneous")
         self.toc_target_heading_count = _get_int_env("TOC_TARGET_HEADING_COUNT", 60)
+        self.content_similarity_threshold = _get_float_env("CONTENT_SIMILARITY_THRESHOLD", 0.95)
+        self.overlap_paragraphs = _get_int_env("OVERLAP_PARAGRAPHS", 2)
+        self.coverage_threshold = _get_float_env("COVERAGE_THRESHOLD", 0.85)
+        self.clean_extracted_text = os.getenv("CLEAN_EXTRACTED_TEXT", "true").lower() in ("true", "1", "yes")
+        self.cleanup_chunk_size = _get_int_env("CLEANUP_CHUNK_SIZE", 6000)
 
     @classmethod
     def from_env(cls):

@@ -6,8 +6,10 @@ from .config import Config
 from .embeddings import EmbeddingStore
 from .toc_manager import TocManager
 from .organizer import ChunkOrganizer, build_prompt_template
-from .utils import load_text, split_text_into_chunks
-from .toc_generator import TocGenerator  # assuming this is there
+from .utils import load_text, split_text_into_chunks, split_text_semantic
+from .toc_generator import TocGenerator
+from .validation import compute_coverage, generate_loss_report
+from .text_cleaner import clean_extracted_text
 
 # This is the tomeweaver/ folder, no matter where you run `python -m tomeweaver`
 BASE_DIR = Path(__file__).resolve().parent
@@ -26,6 +28,16 @@ def run_pipeline(
     resolved_input_path = Path(input_path or config.input_text_path)
     full_text = load_text(str(resolved_input_path))
 
+    # 2b. AI text cleanup — fix merged words, OCR artifacts, garbled characters
+    if config.clean_extracted_text:
+        print("[PIPELINE] Running AI text cleanup...")
+        full_text = clean_extracted_text(
+            full_text,
+            client=config.deepseek_client,
+            chunk_size=config.cleanup_chunk_size,
+        )
+        print(f"[PIPELINE] Text cleanup complete ({len(full_text)} chars).")
+
     # 3. TOC output path
     resolved_toc_path = Path(toc_full_path or config.toc_full_path)
 
@@ -39,9 +51,20 @@ def run_pipeline(
     # 4. Now load the TOC and build the organization prompt
     toc = TocManager(str(resolved_toc_path))
 
-    # 5. Split the text into content chunks for insertion
+    # 4b. TOC completeness pre-check — warn early if the TOC has structural gaps
+    toc_completeness = toc_generator.check_toc_completeness(
+        full_text,
+        headings=toc.get_heading_titles(),
+    )
+
+    # 5. Split the text into semantically coherent chunks with overlap
     resolved_max_chunk_chars = int(max_chunk_chars or config.max_chunk_chars)
-    chunks = split_text_into_chunks(full_text, max_chars=resolved_max_chunk_chars)
+    chunks = split_text_semantic(
+        full_text,
+        embedding_fn=embedding_store.get_embedding,
+        max_chars=resolved_max_chunk_chars,
+        overlap_paragraphs=config.overlap_paragraphs,
+    )
     prompt_template = build_prompt_template(toc)
 
     # 6. Organize chunks and insert into TOC + embeddings DB
@@ -52,10 +75,30 @@ def run_pipeline(
         prompt_template=prompt_template,
         conservative_mode=config.conservative_mode,
         catchall_heading=config.catchall_heading,
+        content_similarity_threshold=config.content_similarity_threshold,
     )
 
     organized_sections = organizer.organize_chunks(chunks)
     organizer.insert_sections(organized_sections)
+
+    # 7. Validate coverage — detect if meaningful content was lost
+    output_text = Path(resolved_toc_path).read_text(encoding="utf-8")
+    coverage = compute_coverage(
+        original_text=full_text,
+        output_text=output_text,
+        embedding_store=embedding_store,
+        threshold=config.coverage_threshold,
+    )
+    loss_report = generate_loss_report(coverage)
+    report_path = Path(resolved_toc_path).parent / "loss_report.md"
+    report_path.write_text(loss_report, encoding="utf-8")
+
+    coverage_score = coverage["coverage_score"]
+    if coverage_score < 0.95:
+        print(f"⚠️  Coverage score: {coverage_score:.1%} — some content may have been lost.")
+        print(f"   See {report_path} for details.")
+    else:
+        print(f"✅ Coverage score: {coverage_score:.1%}")
 
     return {
         "ok": True,
@@ -63,6 +106,10 @@ def run_pipeline(
         "toc_full_path": str(resolved_toc_path),
         "chunk_count": len(chunks),
         "organized_section_count": len(organized_sections),
+        "coverage_score": coverage_score,
+        "loss_report_path": str(report_path),
+        "toc_completeness_ratio": toc_completeness["coverage_ratio"],
+        "toc_uncovered_paragraphs": len(toc_completeness["uncovered"]),
     }
 
 
