@@ -1,0 +1,21 @@
+[Unit]
+Description=TomeWeaver API (FastAPI/Uvicorn)
+After=network.target
+
+[Service]
+Type=exec
+User=crimson
+Group=crimson
+WorkingDirectory=/home/crimson/sites/tomeweaver
+EnvironmentFile=/home/crimson/sites/tomeweaver/.env
+ExecStart=/home/crimson/sites/tomeweaver/.venv/bin/uvicorn tomeweaver.api:app \
+    --host 127.0.0.1 \
+    --port 8010 \
+    --workers 2
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
